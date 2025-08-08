@@ -58,10 +58,9 @@ def token_requerido(f):
 
 
 # ===================== ROTAS PÚBLICAS =====================
-
 @rotas.route("/login", methods=["POST"])
 def login():
-    """Rota de autenticação de usuário"""
+    """Rota de login"""
     dados = request.json
     email = dados.get("email")
     senha = dados.get("senha")
@@ -76,16 +75,54 @@ def login():
         con = fdb.connect(**current_app.config['DB_CONFIG'])
         cur = con.cursor()
 
-        cur.execute("SELECT id, nome_usuario, senha, tipo_usuario FROM usuarios WHERE email = ?", (email,))
+        cur.execute("SELECT id, nome_usuario, senha, tipo_usuario, data_vigencia, status FROM usuarios WHERE email = ?",
+                    (email,))
         usuario = cur.fetchone()
 
         if not usuario:
             return jsonify({"erro": "Email ou senha inválidos."}), 401
 
-        id_usuario, nome_usuario, senha_hash_db, tipo_usuario = usuario
+        id_usuario, nome_usuario, senha_hash_db, tipo_usuario, data_vigencia, status = usuario
 
+        # Verificar se o usuário está inativo ou suspenso
+        if status == "inativo":
+            return jsonify({"erro": "Conta desativada. Entre em contato com o administrador."}), 401
+
+        if status == "suspenso":
+            return jsonify({"erro": "Conta suspensa. Entre em contato com o administrador."}), 401
+
+        # Verificar se a senha está correta primeiro
         if not bcrypt.checkpw(senha.encode(), senha_hash_db.encode()):
             return jsonify({"erro": "Email ou senha inválidos."}), 401
+
+        aviso_expiracao = None
+        dias_restantes = None
+
+        if data_vigencia:
+            data_vigencia_obj = data_vigencia
+            if hasattr(data_vigencia, 'date'):
+                data_vigencia_obj = data_vigencia.date()
+
+            data_atual = datetime.now().date()
+            dias_restantes = (data_vigencia_obj - data_atual).days
+
+            # Se já expirou
+            if dias_restantes <= 0:
+                cur.execute("UPDATE usuarios SET status = 'inativo' WHERE id = ?", (id_usuario,))
+                con.commit()
+
+                return jsonify({
+                    "erro": "Sua conta expirou em {}. Entre em contato com o bibliotecário.".format(
+                        data_vigencia_obj.strftime('%d/%m/%Y')
+                    )
+                }), 401
+
+            # Se expira em 3 dias ou menos (mas ainda não expirou)
+            elif 1 <= dias_restantes <= 3:
+                if dias_restantes == 1:
+                    aviso_expiracao = "ATENÇÃO: Sua conta será desativada AMANHÃ! Procure o bibliotecário urgentemente para renovar seu acesso."
+                else:
+                    aviso_expiracao = f"AVISO: Sua conta será desativada em {dias_restantes} dias ({data_vigencia_obj.strftime('%d/%m/%Y')}). Procure o bibliotecário para aumentar o prazo."
 
         token = gerar_token({
             "id": id_usuario,
@@ -93,7 +130,7 @@ def login():
             "tipo_usuario": tipo_usuario
         })
 
-        return jsonify({
+        resposta = {
             "mensagem": "Login realizado com sucesso!",
             "usuario": {
                 "id": id_usuario,
@@ -102,7 +139,15 @@ def login():
                 "tipo_usuario": tipo_usuario
             },
             "token": token
-        }), 200
+        }
+        if aviso_expiracao:
+            resposta["aviso_expiracao"] = {
+                "mensagem": aviso_expiracao,
+                "dias_restantes": dias_restantes,
+                "data_expiracao": data_vigencia_obj.strftime('%d/%m/%Y')
+            }
+
+        return jsonify(resposta), 200
 
     except Exception as e:
         return jsonify({"erro": str(e)}), 500
@@ -197,13 +242,11 @@ def cadastrar_usuario():
         if con:
             con.close()
 
-
 # ===================== ROTAS PROTEGIDAS =====================
-
 @rotas.route("/usuario/me", methods=["GET"])
 @token_requerido
 def buscar_dados_usuario():
-    """Buscar dados completos do usuário logado"""
+    """Buscar dados completos do usuário"""
     con = None
     cur = None
     try:
@@ -212,11 +255,12 @@ def buscar_dados_usuario():
         con = fdb.connect(**current_app.config['DB_CONFIG'])
         cur = con.cursor()
 
+        # IMPORTANTE: Manter a ordem das colunas consistente
         cur.execute("""
             SELECT 
                 id, nome_usuario, nome_completo, email, curso, data_nascimento, 
                 data_vigencia, codigo_aluno, telefone, sexo, cpf, cep, endereco, 
-                tipo_usuario
+                tipo_usuario, biografia
             FROM usuarios 
             WHERE id = ?
         """, (usuario_id,))
@@ -226,27 +270,31 @@ def buscar_dados_usuario():
         if not resultado:
             return jsonify({"erro": "Usuário não encontrado."}), 404
 
+        # ORDEM DEVE SER EXATAMENTE A MESMA DA QUERY
         colunas = [
             'id', 'nome_usuario', 'nome_completo', 'email', 'curso', 'data_nascimento',
             'data_vigencia', 'codigo_aluno', 'telefone', 'sexo', 'cpf', 'cep',
-            'endereco', 'tipo_usuario'
+            'endereco', 'tipo_usuario', 'biografia'
         ]
 
         dados_usuario = {}
         for i, coluna in enumerate(colunas):
-            if i < len(resultado) and resultado[i] is not None:
+            if i < len(resultado):
                 valor = resultado[i]
 
-                # Formatar datas
-                if coluna in ['data_nascimento', 'data_vigencia']:
-                    if hasattr(valor, 'isoformat'):
-                        dados_usuario[coluna] = valor.isoformat()
-                    elif hasattr(valor, 'strftime'):
-                        dados_usuario[coluna] = valor.strftime('%Y-%m-%d')
+                # Só adicionar se não for None
+                if valor is not None:
+                    # Formatar datas
+                    if coluna in ['data_nascimento', 'data_vigencia']:
+                        if hasattr(valor, 'isoformat'):
+                            dados_usuario[coluna] = valor.isoformat()
+                        elif hasattr(valor, 'strftime'):
+                            dados_usuario[coluna] = valor.strftime('%Y-%m-%d')
+                        else:
+                            dados_usuario[coluna] = str(valor)
                     else:
-                        dados_usuario[coluna] = str(valor)
-                else:
-                    dados_usuario[coluna] = valor
+                        dados_usuario[coluna] = valor
+                # Se for None, não adicionar ao dicionário (campo vazio)
 
         # Remover ID por segurança
         dados_usuario.pop('id', None)
@@ -265,6 +313,340 @@ def buscar_dados_usuario():
         if con:
             con.close()
 
+
+@rotas.route("/usuarios/<int:usuario_id>", methods=["PUT"])
+@token_requerido
+def atualizar_usuario(usuario_id):
+    """Atualizar dados do usuário (seções separadas)"""
+    dados = request.json
+    secao = dados.get("secao")  # conta, usuario, curso, contato
+
+    # Verificar se o usuário pode editar
+    usuario_logado_id = request.usuario.get('id')
+    tipo_usuario_logado = request.usuario.get('tipo_usuario')
+
+    # Usuários só podem editar seus próprios dados, administradores podem editar qualquer usuário
+    if usuario_logado_id != usuario_id and tipo_usuario_logado not in ['administrador', 'bibliotecario']:
+        return jsonify({"erro": "Acesso negado. Você só pode editar seus próprios dados."}), 403
+
+    if not secao:
+        return jsonify({"erro": "Seção é obrigatória (conta, usuario, curso, contato)."}), 400
+
+    con = None
+    cur = None
+    try:
+        con = fdb.connect(**current_app.config['DB_CONFIG'])
+        cur = con.cursor()
+
+        # Verificar se usuário existe
+        cur.execute("SELECT id, tipo_usuario FROM usuarios WHERE id = ?", (usuario_id,))
+        usuario_existe = cur.fetchone()
+
+        if not usuario_existe:
+            return jsonify({"erro": "Usuário não encontrado."}), 404
+
+        # Processar cada seção separadamente
+        if secao == "conta":
+            return atualizar_informacoes_conta(cur, con, usuario_id, dados)
+        elif secao == "usuario":
+            return atualizar_informacoes_usuario(cur, con, usuario_id, dados)
+        elif secao == "curso":
+            return atualizar_informacoes_curso(cur, con, usuario_id, dados, tipo_usuario_logado)
+        elif secao == "contato":
+            return atualizar_informacoes_contato(cur, con, usuario_id, dados)
+        else:
+            return jsonify({"erro": "Seção inválida. Use: conta, usuario, curso ou contato."}), 400
+
+    except Exception as e:
+        if con:
+            con.rollback()
+        return jsonify({"erro": f"Erro interno do servidor: {str(e)}"}), 500
+
+    finally:
+        if cur:
+            cur.close()
+        if con:
+            con.close()
+
+
+# ===================== FUNÇÕES AUXILIARES PARA CADA SEÇÃO =====================
+def atualizar_informacoes_conta(cur, con, usuario_id, dados):
+    """Atualizar informações da conta"""
+    nome_usuario = dados.get("nome_usuario")
+    biografia = dados.get("biografia")
+
+    # ADICIONAR VALIDAÇÃO OBRIGATÓRIA
+    # Nome de usuário é obrigatório
+    if not nome_usuario or not nome_usuario.strip():
+        return jsonify({"erro": "Nome de usuário é obrigatório."}), 400
+
+    # Verificar duplicidade de nome de usuário
+    cur.execute("SELECT 1 FROM usuarios WHERE nome_usuario = ? AND id != ?", (nome_usuario.strip(), usuario_id))
+    if cur.fetchone():
+        return jsonify({"erro": "Nome de usuário já está em uso."}), 409
+
+    campos_atualizacao = []
+    valores = []
+
+    # Nome usuário (obrigatório)
+    campos_atualizacao.append("nome_usuario = ?")
+    valores.append(nome_usuario.strip())
+
+    # Biografia (opcional)
+    campos_atualizacao.append("biografia = ?")
+    valores.append(biografia.strip() if biografia and biografia.strip() else None)
+
+    # Executar atualização
+    valores.append(usuario_id)
+    query = f"UPDATE usuarios SET {', '.join(campos_atualizacao)} WHERE id = ?"
+    cur.execute(query, valores)
+    con.commit()
+
+    return jsonify({"mensagem": "Informações da conta atualizadas com sucesso!"}), 200
+
+def atualizar_informacoes_curso(cur, con, usuario_id, dados, tipo_usuario_logado):
+    """Atualizar informações do curso"""
+    curso = dados.get("curso")
+    periodo = dados.get("periodo")
+    codigo_aluno = dados.get("codigo_aluno")
+    data_vigencia = dados.get("data_vigencia")
+
+    # ADICIONAR VALIDAÇÕES OBRIGATÓRIAS
+    # Curso é obrigatório
+    if not curso or not curso.strip():
+        return jsonify({"erro": "Curso é obrigatório."}), 400
+
+    # Código do aluno é obrigatório
+    if not codigo_aluno or not codigo_aluno.strip():
+        return jsonify({"erro": "Código de aluno é obrigatório."}), 400
+
+    # Verificar se usuário comum está tentando alterar data de vigência
+    if data_vigencia is not None and tipo_usuario_logado not in ['administrador', 'bibliotecario']:
+        return jsonify({"erro": "Apenas administradores podem alterar a data de vigência."}), 403
+
+    # Validações de formato
+    if data_vigencia and data_vigencia.strip():
+        try:
+            datetime.strptime(data_vigencia, '%Y-%m-%d')
+        except ValueError:
+            return jsonify({"erro": "Formato de data de vigência inválido. Use YYYY-MM-DD."}), 400
+
+    # Verificar duplicidade de código de aluno
+    if codigo_aluno and codigo_aluno.strip():
+        cur.execute("SELECT 1 FROM usuarios WHERE codigo_aluno = ? AND id != ?", (codigo_aluno, usuario_id))
+        if cur.fetchone():
+            return jsonify({"erro": "Código de aluno já está em uso."}), 409
+
+    campos_atualizacao = []
+    valores = []
+
+    # Curso (obrigatório)
+    campos_atualizacao.append("curso = ?")
+    valores.append(curso.strip())
+
+    # Período (opcional)
+    campos_atualizacao.append("periodo = ?")
+    valores.append(periodo.strip() if periodo and periodo.strip() else None)
+
+    # Código aluno (obrigatório)
+    campos_atualizacao.append("codigo_aluno = ?")
+    valores.append(codigo_aluno.strip())
+
+    # Data vigência (opcional, apenas para admins)
+    if tipo_usuario_logado in ['bibliotecario']:
+        campos_atualizacao.append("data_vigencia = ?")
+        valores.append(data_vigencia.strip() if data_vigencia and data_vigencia.strip() else None)
+
+    # Executar atualização
+    valores.append(usuario_id)
+    query = f"UPDATE usuarios SET {', '.join(campos_atualizacao)} WHERE id = ?"
+    cur.execute(query, valores)
+    con.commit()
+
+    return jsonify({"mensagem": "Informações do curso atualizadas com sucesso!"}), 200
+
+def atualizar_informacoes_usuario(cur, con, usuario_id, dados):
+    """Atualizar informações pessoais do usuário"""
+    nome_completo = dados.get("nome_completo")
+    cpf = dados.get("cpf")
+    sexo = dados.get("sexo")
+    data_nascimento = dados.get("data_nascimento")
+
+    # ADICIONAR VALIDAÇÕES OBRIGATÓRIAS
+    # Nome completo é obrigatório
+    if not nome_completo or not nome_completo.strip():
+        return jsonify({"erro": "Nome completo é obrigatório."}), 400
+
+    # Data de nascimento é obrigatória
+    if not data_nascimento or not data_nascimento.strip():
+        return jsonify({"erro": "Data de nascimento é obrigatória."}), 400
+
+    # Validações existentes
+    if sexo is not None and sexo not in ['masculino', 'feminino','']:
+        return jsonify({"erro": "Sexo deve ser 'masculino' ou 'feminino'."}), 400
+
+    if data_nascimento:
+        try:
+            datetime.strptime(data_nascimento, '%Y-%m-%d')
+        except ValueError:
+            return jsonify({"erro": "Formato de data de nascimento inválido. Use YYYY-MM-DD."}), 400
+
+    # Verificar duplicidade de CPF apenas se fornecido
+    if cpf and cpf.strip():
+        cur.execute("SELECT 1 FROM usuarios WHERE cpf = ? AND id != ?", (cpf, usuario_id))
+        if cur.fetchone():
+            return jsonify({"erro": "CPF já está cadastrado para outro usuário."}), 409
+
+    campos_atualizacao = []
+    valores = []
+
+    # Nome completo (obrigatório)
+    campos_atualizacao.append("nome_completo = ?")
+    valores.append(nome_completo.strip())
+
+    # CPF (opcional)
+    campos_atualizacao.append("cpf = ?")
+    valores.append(cpf.strip() if cpf and cpf.strip() else None)
+
+    # Sexo (opcional)
+    campos_atualizacao.append("sexo = ?")
+    valores.append(sexo.strip() if sexo and sexo.strip() else None)
+
+    # Data nascimento (obrigatório)
+    campos_atualizacao.append("data_nascimento = ?")
+    valores.append(data_nascimento.strip())
+
+    # Executar atualização
+    valores.append(usuario_id)
+    query = f"UPDATE usuarios SET {', '.join(campos_atualizacao)} WHERE id = ?"
+    cur.execute(query, valores)
+    con.commit()
+
+    return jsonify({"mensagem": "Informações pessoais atualizadas com sucesso!"}), 200
+
+def atualizar_informacoes_contato(cur, con, usuario_id, dados):
+    """Atualizar informações de contato"""
+    email = dados.get("email")
+    telefone = dados.get("telefone")
+    cep = dados.get("cep")
+    endereco = dados.get("endereco")
+
+    # ADICIONAR VALIDAÇÕES OBRIGATÓRIAS
+    # Email é obrigatório
+    if not email or not email.strip():
+        return jsonify({"erro": "Email é obrigatório."}), 400
+
+    # Telefone é obrigatório
+    if not telefone or not telefone.strip():
+        return jsonify({"erro": "Telefone é obrigatório."}), 400
+
+    # Validações de formato
+    if not validar_email(email):
+        return jsonify({"erro": "Formato de email inválido."}), 400
+
+    # Verificar duplicidade de email
+    cur.execute("SELECT 1 FROM usuarios WHERE email = ? AND id != ?", (email, usuario_id))
+    if cur.fetchone():
+        return jsonify({"erro": "Email já está em uso."}), 409
+
+    campos_atualizacao = []
+    valores = []
+
+    # Email (obrigatório)
+    campos_atualizacao.append("email = ?")
+    valores.append(email.strip())
+
+    # Telefone (obrigatório)
+    campos_atualizacao.append("telefone = ?")
+    valores.append(telefone.strip())
+
+    # CEP (opcional)
+    campos_atualizacao.append("cep = ?")
+    valores.append(cep.strip() if cep and cep.strip() else None)
+
+    # Endereço (opcional)
+    campos_atualizacao.append("endereco = ?")
+    valores.append(endereco.strip() if endereco and endereco.strip() else None)
+
+    # Executar atualização
+    valores.append(usuario_id)
+    query = f"UPDATE usuarios SET {', '.join(campos_atualizacao)} WHERE id = ?"
+    cur.execute(query, valores)
+    con.commit()
+
+    return jsonify({"mensagem": "Informações de contato atualizadas com sucesso!"}), 200
+
+
+# ===================== ROTA ADICIONAL PARA BUSCAR USUÁRIO ESPECÍFICO =====================
+
+@rotas.route("/usuarios/<int:usuario_id>", methods=["GET"])
+@token_requerido
+def buscar_usuario_especifico(usuario_id):
+    """Buscar dados de um usuário específico"""
+    usuario_logado_id = request.usuario.get('id')
+    tipo_usuario_logado = request.usuario.get('tipo_usuario')
+
+    # Usuários só podem ver seus próprios dados, administradores podem ver qualquer usuário
+    if usuario_logado_id != usuario_id and tipo_usuario_logado not in ['administrador', 'bibliotecario']:
+        return jsonify({"erro": "Acesso negado."}), 403
+
+    con = None
+    cur = None
+    try:
+        con = fdb.connect(**current_app.config['DB_CONFIG'])
+        cur = con.cursor()
+
+        cur.execute("""
+            SELECT 
+                id, nome_usuario, biografia, nome_completo, cpf, sexo, data_nascimento,
+                curso, periodo, codigo_aluno, data_vigencia, email, telefone, cep, endereco,
+                tipo_usuario
+            FROM usuarios 
+            WHERE id = ?
+        """, (usuario_id,))
+
+        resultado = cur.fetchone()
+
+        if not resultado:
+            return jsonify({"erro": "Usuário não encontrado."}), 404
+
+        colunas = [
+            'id', 'nome_usuario', 'biografia', 'nome_completo', 'cpf', 'sexo', 'data_nascimento',
+            'curso', 'periodo', 'codigo_aluno', 'data_vigencia', 'email', 'telefone', 'cep',
+            'endereco', 'tipo_usuario'
+        ]
+
+        dados_usuario = {}
+        for i, coluna in enumerate(colunas):
+            if i < len(resultado):
+                valor = resultado[i]
+
+                # Formatar datas
+                if coluna in ['data_nascimento', 'data_vigencia'] and valor:
+                    if hasattr(valor, 'strftime'):
+                        dados_usuario[coluna] = valor.strftime('%Y-%m-%d')
+                    else:
+                        dados_usuario[coluna] = str(valor)
+                else:
+                    dados_usuario[coluna] = valor
+
+        # Remover ID por segurança se não for admin
+        if tipo_usuario_logado not in ['administrador', 'bibliotecario']:
+            dados_usuario.pop('id', None)
+
+        return jsonify({
+            "mensagem": "Dados do usuário obtidos com sucesso!",
+            "usuario": dados_usuario
+        }), 200
+
+    except Exception as e:
+        return jsonify({"erro": f"Erro interno do servidor: {str(e)}"}), 500
+
+    finally:
+        if cur:
+            cur.close()
+        if con:
+            con.close()
 
 @rotas.route("/logout", methods=["POST"])
 @token_requerido
@@ -328,15 +710,6 @@ def listar_usuarios():
 @rotas.route("/usuarios/<int:usuario_id>", methods=["DELETE"])
 @token_requerido
 def deletar_usuario(usuario_id):
-    """Deletar usuário (apenas para administradores)"""
-    # Verificar se é administrador
-    if request.usuario.get('tipo_usuario') != 'administrador':
-        return jsonify({"erro": "Acesso negado. Apenas administradores podem deletar usuários."}), 403
-
-    # Impedir auto-exclusão
-    if request.usuario.get('id') == usuario_id:
-        return jsonify({"erro": "Você não pode deletar sua própria conta."}), 400
-
     con = None
     cur = None
     try:
